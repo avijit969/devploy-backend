@@ -1,5 +1,5 @@
 import { serve } from "@hono/node-server";
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import { cors } from "hono/cors";
 import { exec } from "child_process";
 import fs from "fs";
@@ -33,47 +33,133 @@ const s3 = new S3Client({
 });
 
 // Deploy API
-app.post("/api/deploy", async (c) => {
+
+// Utility: detect framework and get build output directory
+function detectFramework(
+  pkgJson: any,
+  folder: string
+): {
+  name: string;
+  buildCommand: string;
+  outDir: string;
+} {
+  if (pkgJson.dependencies?.next || pkgJson.devDependencies?.next) {
+    return { name: "Next.js", buildCommand: "npm run build", outDir: ".next" };
+  }
+  if (
+    pkgJson.dependencies?.vite ||
+    fs.existsSync(path.join(folder, "vite.config.js"))
+  ) {
+    return { name: "Vite", buildCommand: "npm run build", outDir: "dist" };
+  }
+  if (
+    pkgJson.dependencies?.react &&
+    fs.existsSync(path.join(folder, "public"))
+  ) {
+    return { name: "CRA", buildCommand: "npm run build", outDir: "dist" };
+  }
+  if (
+    pkgJson.dependencies?.vue &&
+    fs.existsSync(path.join(folder, "vue.config.js"))
+  ) {
+    return { name: "Vue", buildCommand: "npm run build", outDir: "dist" };
+  }
+  if (
+    pkgJson.dependencies?.astro &&
+    fs.existsSync(path.join(folder, "astro.config.mjs"))
+  ) {
+    return { name: "Astro", buildCommand: "npm run build", outDir: "dist" };
+  }
+  if (
+    pkgJson.dependencies?.svelte &&
+    fs.existsSync(path.join(folder, "svelte.config.js"))
+  ) {
+    return { name: "Svelte", buildCommand: "npm run build", outDir: "dist" };
+  }
+
+  // fallback
+  return { name: "Unknown", buildCommand: "npm run build", outDir: "dist" };
+}
+
+app.post("/api/deploy", async (c: Context) => {
   const body = await c.req.json();
   const { repositoryUrl, applicationName } = body;
-  console.log(
-    process.env.R2_ENDPOINT,
-    process.env.R2_ACCESS_KEY_ID,
-    process.env.R2_SECRET_ACCESS_KEY,
-    process.env.R2_BUCKET_NAME
-  );
   const folder = `./tmp/${Date.now()}-${applicationName}`;
-  const buildPath = `${folder}/dist`;
+  const logs: string[] = [];
 
   try {
     await simpleGit().clone(repositoryUrl, folder);
+    console.log(`✅ Cloned repo: ${repositoryUrl}`);
+    logs.push(`✅ Cloned repo: ${repositoryUrl}`);
 
-    // Run install & build
-    await execPromise(`cd ${folder} && npm install && npm run build`);
+    // Load and parse package.json
+    const pkgPath = path.join(folder, "package.json");
+    const pkgJson = JSON.parse(fs.readFileSync(pkgPath, "utf-8"));
 
-    // Upload build to R2
-    await uploadDirToR2(buildPath, applicationName);
+    // Detect framework
+    const {
+      name: framework,
+      buildCommand,
+      outDir,
+    } = detectFramework(pkgJson, folder);
+    console.log(`📦 Detected Framework: ${framework}`);
+    console.log(`⚙️ Build Command: ${buildCommand}`);
+    console.log(`⚙️ OutDir: ${outDir}`);
+    logs.push(`📦 Detected Framework: ${framework}`);
+    logs.push(`⚙️ Build Command: ${buildCommand}`);
+
+    // Install dependencies
+    const installResult = await execPromise(`cd ${folder} && npm install`);
+    logs.push(`📥 npm install:\n${installResult}`);
+    console.log(`📥 npm install:\n${installResult}`);
+
+    // Run build
+    const buildResult = await execPromise(`cd ${folder} && ${buildCommand}`);
+    logs.push(`🔨 Build Output:\n${buildResult}`);
+    console.log(`🔨 Build Output:\n${buildResult}`);
+
+    // Upload to R2
+    const buildOutputPath = path.join(folder, outDir);
+    await uploadDirToR2(buildOutputPath, applicationName);
+    logs.push(`🚀 Uploaded to R2 under: ${applicationName}/`);
+    console.log(`🚀 Uploaded to R2 under: ${applicationName}/`);
 
     // Clean up
     fs.rmSync(folder, { recursive: true, force: true });
+    console.log(`🗑️ Cleaned up: ${folder}`);
 
     return c.json({
       success: true,
       message: "Deployment successful",
       url: `http://${applicationName}${process.env.BASE_URL}`,
+      logs: logs.join("\n\n"),
     });
-  } catch (err) {
+  } catch (err: any) {
     console.error("Deployment Error:", err);
-    return c.json({ success: false, message: "Deployment failed" });
+    if (err.stdout || err.stderr) {
+      logs.push(`❌ Error:\n${err.stderr || err.error}`);
+      logs.push(`🧾 Partial stdout:\n${err.stdout}`);
+      console.log(`❌ Error:\n${err.stderr || err.error}`);
+      console.log(`🧾 Partial stdout:\n${err.stdout}`);
+    } else {
+      logs.push(`❌ Unexpected Error:\n${err.toString()}`);
+      console.log(`❌ Unexpected Error:\n${err.toString()}`);
+    }
+
+    return c.json({
+      success: false,
+      message: "Deployment failed",
+      logs: logs.join("\n\n"),
+    });
   }
 });
 
 // Promisify exec
-function execPromise(cmd: string): Promise<void> {
+function execPromise(cmd: string): Promise<string> {
   return new Promise((resolve, reject) => {
     exec(cmd, (err, stdout, stderr) => {
       if (err) return reject(stderr || err.message);
-      return resolve();
+      return resolve(stdout);
     });
   });
 }

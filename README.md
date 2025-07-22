@@ -1,8 +1,3 @@
-```
-npm install
-npm run dev
-```
+# DevPloy Backend
 
-```
-open http://localhost:3000
-```
+This is the backend for DevPloy, a deployment tool for web applications. written in typescript using hono and nodejs.
