@@ -196,7 +196,13 @@ app.get("*", async (c) => {
   const subdomain = host.split(".")[0];
   const reqPath = c.req.path === "/" ? "/index.html" : c.req.path;
   const key = `${subdomain}${reqPath}`;
-
+  console.log(
+    `Serving ${key}` +
+      "\n" +
+      `subdomain: ${subdomain}` +
+      "\n" +
+      `reqPath: ${reqPath}`
+  );
   try {
     const result = await s3.send(
       new GetObjectCommand({
