@@ -192,17 +192,16 @@ async function uploadDirToR2(dirPath: string, subdomain: string) {
 
 // Serve deployed files by subdomain
 app.get("*", async (c) => {
-  const host = c.req.header("host") || "";
-  const subdomain = host.split(".")[0];
+  const host = c.req.header("Host") || "";
+  // "https://avijit.devploy-backend.avijit.site/"
+  const domainRoot = "devploy-backend.avijit.site"; // your apex domain
+  const subdomain = host.replace(`.${domainRoot}`, "");
+
   const reqPath = c.req.path === "/" ? "/index.html" : c.req.path;
   const key = `${subdomain}${reqPath}`;
-  console.log(
-    `Serving ${key}` +
-      "\n" +
-      `subdomain: ${subdomain}` +
-      "\n" +
-      `reqPath: ${reqPath}`
-  );
+
+  console.log(`Serving ${key}\nsubdomain: ${subdomain}\nreqPath: ${reqPath}`);
+
   try {
     const result = await s3.send(
       new GetObjectCommand({
