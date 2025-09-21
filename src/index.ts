@@ -81,6 +81,9 @@ function detectFramework(
   return { name: "Unknown", buildCommand: "npm run build", outDir: "dist" };
 }
 
+app.get("/health", (c: Context) => {
+  return c.json({ success: true });
+});
 app.post("/api/deploy", async (c: Context) => {
   const body = await c.req.json();
   const { repositoryUrl, applicationName } = body;
