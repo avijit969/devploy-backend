@@ -8,10 +8,15 @@ import { simpleGit } from "simple-git";
 import {
   S3Client,
   PutObjectCommand,
-  GetObjectCommand,
+  ListObjectsV2Command,
+  DeleteObjectCommand,
 } from "@aws-sdk/client-s3";
 import mime from "mime-types";
 import dotenv from "dotenv";
+
+import { drizzle } from "drizzle-orm/neon-http";
+import { builds, projects } from "./db/schema.js";
+import { eq } from "drizzle-orm";
 
 dotenv.config({
   path: "./.env",
@@ -21,7 +26,7 @@ dotenv.config({
 const app = new Hono();
 app.use("*", cors());
 
-// Cloudflare R2 S3-compatible client
+// Cloudflare R2 client
 const s3 = new S3Client({
   region: "auto",
   forcePathStyle: true,
@@ -32,17 +37,39 @@ const s3 = new S3Client({
   },
 });
 
-// Deploy API
+/* -------------------------------------------------------
+   DELETE OLD BUILD FOLDER FROM R2
+------------------------------------------------------- */
+async function deleteFolderFromR2(prefix: string) {
+  const list = await s3.send(
+    new ListObjectsV2Command({
+      Bucket: process.env.R2_BUCKET_NAME,
+      Prefix: prefix,
+    })
+  );
 
-// Utility: detect framework and get build output directory
-function detectFramework(
-  pkgJson: any,
-  folder: string
-): {
-  name: string;
-  buildCommand: string;
-  outDir: string;
-} {
+  if (!list.Contents || list.Contents.length === 0) {
+    console.log(`ℹ️ No previous build to delete for: ${prefix}`);
+    return;
+  }
+
+  console.log(`🗑️ Deleting old files in R2: ${prefix}`);
+
+  for (const file of list.Contents) {
+    await s3.send(
+      new DeleteObjectCommand({
+        Bucket: process.env.R2_BUCKET_NAME,
+        Key: file.Key!,
+      })
+    );
+    console.log(`❌ Deleted: ${file.Key}`);
+  }
+}
+
+/* -------------------------------------------------------
+   DETECT FRAMEWORK & BUILDPATH
+------------------------------------------------------- */
+function detectFramework(pkgJson: any, folder: string) {
   if (pkgJson.dependencies?.next || pkgJson.devDependencies?.next) {
     return { name: "Next.js", buildCommand: "npm run build", outDir: ".next" };
   }
@@ -64,107 +91,13 @@ function detectFramework(
   ) {
     return { name: "Vue", buildCommand: "npm run build", outDir: "dist" };
   }
-  if (
-    pkgJson.dependencies?.astro &&
-    fs.existsSync(path.join(folder, "astro.config.mjs"))
-  ) {
-    return { name: "Astro", buildCommand: "npm run build", outDir: "dist" };
-  }
-  if (
-    pkgJson.dependencies?.svelte &&
-    fs.existsSync(path.join(folder, "svelte.config.js"))
-  ) {
-    return { name: "Svelte", buildCommand: "npm run build", outDir: "dist" };
-  }
 
-  // fallback
   return { name: "Unknown", buildCommand: "npm run build", outDir: "dist" };
 }
 
-app.get("/health", (c: Context) => {
-  return c.json({ success: true });
-});
-app.post("/api/webhook", async (c: Context) => {
-  console.log("Webhook received");
-  const body = await c.req.json();
-  console.log(body);
-  return c.json({ success: true });
-});
-
-app.post("/api/deploy", async (c: Context) => {
-  const body = await c.req.json();
-  const { repositoryUrl, applicationName } = body;
-  const folder = `./tmp/${Date.now()}-${applicationName}`;
-  const logs: string[] = [];
-
-  try {
-    await simpleGit().clone(repositoryUrl, folder);
-    console.log(`✅ Cloned repo: ${repositoryUrl}`);
-    logs.push(`✅ Cloned repo: ${repositoryUrl}`);
-
-    // Load and parse package.json
-    const pkgPath = path.join(folder, "package.json");
-    const pkgJson = JSON.parse(fs.readFileSync(pkgPath, "utf-8"));
-
-    // Detect framework
-    const {
-      name: framework,
-      buildCommand,
-      outDir,
-    } = detectFramework(pkgJson, folder);
-    console.log(`📦 Detected Framework: ${framework}`);
-    console.log(`⚙️ Build Command: ${buildCommand}`);
-    console.log(`⚙️ OutDir: ${outDir}`);
-    logs.push(`📦 Detected Framework: ${framework}`);
-    logs.push(`⚙️ Build Command: ${buildCommand}`);
-
-    // Install dependencies
-    const installResult = await execPromise(`cd ${folder} && npm install`);
-    logs.push(`📥 npm install:\n${installResult}`);
-    console.log(`📥 npm install:\n${installResult}`);
-
-    // Run build
-    const buildResult = await execPromise(`cd ${folder} && ${buildCommand}`);
-    logs.push(`🔨 Build Output:\n${buildResult}`);
-    console.log(`🔨 Build Output:\n${buildResult}`);
-
-    // Upload to R2
-    const buildOutputPath = path.join(folder, outDir);
-    await uploadDirToR2(buildOutputPath, applicationName);
-    logs.push(`🚀 Uploaded to R2 under: ${applicationName}/`);
-    console.log(`🚀 Uploaded to R2 under: ${applicationName}/`);
-
-    // Clean up
-    fs.rmSync(folder, { recursive: true, force: true });
-    console.log(`🗑️ Cleaned up: ${folder}`);
-
-    return c.json({
-      success: true,
-      message: "Deployment successful",
-      url: `https://${applicationName}${process.env.BASE_URL}`,
-      logs: logs.join("\n\n"),
-    });
-  } catch (err: any) {
-    console.error("Deployment Error:", err);
-    if (err.stdout || err.stderr) {
-      logs.push(`❌ Error:\n${err.stderr || err.error}`);
-      logs.push(`🧾 Partial stdout:\n${err.stdout}`);
-      console.log(`❌ Error:\n${err.stderr || err.error}`);
-      console.log(`🧾 Partial stdout:\n${err.stdout}`);
-    } else {
-      logs.push(`❌ Unexpected Error:\n${err.toString()}`);
-      console.log(`❌ Unexpected Error:\n${err.toString()}`);
-    }
-
-    return c.json({
-      success: false,
-      message: "Deployment failed",
-      logs: logs.join("\n\n"),
-    });
-  }
-});
-
-// Promisify exec
+/* -------------------------------------------------------
+   EXEC HELPER (PROMISE)
+------------------------------------------------------- */
 function execPromise(cmd: string): Promise<string> {
   return new Promise((resolve, reject) => {
     exec(cmd, (err, stdout, stderr) => {
@@ -174,7 +107,9 @@ function execPromise(cmd: string): Promise<string> {
   });
 }
 
-// Upload folder recursively to R2
+/* -------------------------------------------------------
+   RECURSIVE UPLOAD TO R2
+------------------------------------------------------- */
 async function uploadDirToR2(dirPath: string, subdomain: string) {
   const entries = fs.readdirSync(dirPath, { withFileTypes: true });
 
@@ -188,7 +123,7 @@ async function uploadDirToR2(dirPath: string, subdomain: string) {
       const fileContent = fs.readFileSync(filePath);
       const contentType = mime.lookup(entry.name) || "application/octet-stream";
 
-      const result = await s3.send(
+      await s3.send(
         new PutObjectCommand({
           Bucket: process.env.R2_BUCKET_NAME,
           Key: key,
@@ -200,7 +135,155 @@ async function uploadDirToR2(dirPath: string, subdomain: string) {
   }
 }
 
-// Start server
+/* -------------------------------------------------------
+   START BUILD (TRIGGERED BY WEBHOOK)
+------------------------------------------------------- */
+async function startBuild(
+  projectId: number,
+  projectName: string,
+  repo_url: string
+) {
+  const db = drizzle(process.env.DATABASE_URL!);
+
+  const inserted = await db
+    .insert(builds)
+    .values({
+      projectId,
+      build_status: "pending",
+      build_number: 1,
+      build_url: `https://${projectName}${process.env.BASE_URL}`,
+      build_log: "",
+    })
+    .returning();
+
+  console.log("🆕 Build record created:", inserted);
+
+  const buildId = inserted[0].id;
+
+  const tempFolder = `./tmp/${Date.now()}-${projectName}`;
+  console.log(`📁 temp folder: ${tempFolder}`);
+
+  try {
+    console.log("⏳ Cloning...");
+    await simpleGit().clone(repo_url, tempFolder);
+
+    const pkgPath = path.join(tempFolder, "package.json");
+    const pkgJson = JSON.parse(fs.readFileSync(pkgPath, "utf-8"));
+    const {
+      name: framework,
+      buildCommand,
+      outDir,
+    } = detectFramework(pkgJson, tempFolder);
+
+    await execPromise(`cd ${tempFolder} && npm install`);
+    await execPromise(`cd ${tempFolder} && ${buildCommand}`);
+
+    // DELETE OLD DEPLOY
+    await deleteFolderFromR2(`${projectName}/`);
+
+    // UPLOAD NEW BUILD
+    await uploadDirToR2(path.join(tempFolder, outDir), projectName);
+
+    fs.rmSync(tempFolder, { recursive: true, force: true });
+
+    await db
+      .update(builds)
+      .set({ build_status: "success" })
+      .where(eq(builds.id, buildId));
+
+    console.log("🎉 Build Successful!");
+  } catch (err) {
+    console.log("❌ Build Failed", err);
+
+    await db
+      .update(builds)
+      .set({ build_status: "failed" })
+      .where(eq(builds.id, buildId));
+  }
+}
+
+app.get("/health", (c: Context) => {
+  return c.json({ success: true });
+});
+app.get("/all", async (c: Context) => {
+  const db = drizzle(process.env.DATABASE_URL!);
+  const allProjects = await db.select().from(projects);
+  return c.json({ success: true, projects: allProjects });
+});
+/* ----------------------
+   GITHUB WEBHOOK
+---------------------- */
+app.post("/api/webhook", async (c: Context) => {
+  const db = drizzle(process.env.DATABASE_URL!);
+  console.log("📩 Webhook received");
+
+  const body = await c.req.json();
+  const repo_url = body.repository.clone_url;
+
+  const project = await db
+    .select()
+    .from(projects)
+    .where(eq(projects.repo_url, repo_url));
+
+  if (project.length === 0) {
+    return c.json({ success: false, message: "Project not registered" });
+  }
+
+  const p = project[0];
+
+  console.log("🚀 Starting build for project:", p.name);
+
+  startBuild(p.id, p.name, repo_url);
+
+  return c.json({ success: true, message: "Build started" });
+});
+
+/* ----------------------
+   MANUAL DEPLOY API
+---------------------- */
+app.post("/api/deploy", async (c: Context) => {
+  const body = await c.req.json();
+  const { repositoryUrl, applicationName } = body;
+
+  const folder = `./tmp/${Date.now()}-${applicationName}`;
+  const logs: string[] = [];
+
+  try {
+    await simpleGit().clone(repositoryUrl, folder);
+
+    const pkgJson = JSON.parse(
+      fs.readFileSync(path.join(folder, "package.json"), "utf-8")
+    );
+    const { buildCommand, outDir } = detectFramework(pkgJson, folder);
+
+    await execPromise(`cd ${folder} && npm install`);
+    await execPromise(`cd ${folder} && ${buildCommand}`);
+
+    // DELETE OLD
+    await deleteFolderFromR2(`${applicationName}/`);
+
+    // UPLOAD NEW
+    await uploadDirToR2(path.join(folder, outDir), applicationName);
+
+    fs.rmSync(folder, { recursive: true, force: true });
+
+    return c.json({
+      success: true,
+      message: "Deployment successful",
+      url: `https://${applicationName}${process.env.BASE_URL}`,
+    });
+  } catch (err: any) {
+    return c.json({
+      success: false,
+      message: "Deployment failed",
+      error: err.toString(),
+    });
+  }
+});
+
+/* -------------------------------------------------------
+   START SERVER
+------------------------------------------------------- */
 serve(
   {
     fetch: app.fetch,
