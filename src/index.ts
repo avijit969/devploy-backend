@@ -84,6 +84,13 @@ function detectFramework(
 app.get("/health", (c: Context) => {
   return c.json({ success: true });
 });
+app.post("/api/webhook", async (c: Context) => {
+  console.log("Webhook received");
+  const body = await c.req.json();
+  console.log(body);
+  return c.json({ success: true });
+});
+
 app.post("/api/deploy", async (c: Context) => {
   const body = await c.req.json();
   const { repositoryUrl, applicationName } = body;
@@ -134,7 +141,7 @@ app.post("/api/deploy", async (c: Context) => {
     return c.json({
       success: true,
       message: "Deployment successful",
-      url: `http://${applicationName}${process.env.BASE_URL}`,
+      url: `https://${applicationName}${process.env.BASE_URL}`,
       logs: logs.join("\n\n"),
     });
   } catch (err: any) {
@@ -192,36 +199,6 @@ async function uploadDirToR2(dirPath: string, subdomain: string) {
     }
   }
 }
-
-// Serve deployed files by subdomain
-app.get("*", async (c) => {
-  const host = c.req.header("Host") || "";
-  // "https://avijit.devploy-backend.avijit.site/"
-  const domainRoot = "localhost:3001"; // your apex domain
-  const subdomain = host.replace(`.${process.env.ROOT_DOMAIN}`, "");
-
-  const reqPath = c.req.path === "/" ? "/index.html" : c.req.path;
-  const key = `${subdomain}${reqPath}`;
-
-  console.log(`Serving ${key}\nsubdomain: ${subdomain}\nreqPath: ${reqPath}`);
-  console.log("key: ", key);
-  try {
-    const result = await s3.send(
-      new GetObjectCommand({
-        Bucket: process.env.R2_BUCKET_NAME,
-        Key: key,
-      })
-    );
-
-    return new Response(result.Body as ReadableStream, {
-      headers: {
-        "Content-Type": result.ContentType || "text/html",
-      },
-    });
-  } catch (err) {
-    return c.text("Not Found", 404);
-  }
-});
 
 // Start server
 serve(
